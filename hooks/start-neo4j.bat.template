@@ -1,0 +1,14 @@
+@echo off
+REM Neo4j startup script that hides console windows
+setlocal enabledelayedexpansion
+
+REM Get the directory where this batch file is located
+set "SCRIPT_DIR=%~dp0"
+cd "%SCRIPT_DIR%"
+
+REM Set Java environment
+set "JAVA_HOME=%SCRIPT_DIR%jre"
+set "PATH=%JAVA_HOME%\bin;%PATH%"
+
+REM Start Neo4j with hidden window
+start /b "" "%SCRIPT_DIR%neo4j-server\bin\neo4j.bat" console
