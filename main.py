@@ -337,13 +337,39 @@ class Neo4jDatabaseManager:
     
     def close(self):
         """Close the Neo4j connection"""
-        if self.driver:
-            try:
+        try:
+            if self.driver:
                 self.driver.close()
+                self.connected = False
                 log_message("Neo4j connection closed")
-            except Exception as e:
-                log_message(f"Error closing Neo4j connection: {str(e)}", True)
-        self.connected = False
+        except Exception as e:
+            log_message(f"Error closing Neo4j connection: {str(e)}", True)
+    
+    def ensure_database_exists(self):
+        """Ensure the database exists, create it if it doesn't"""
+        try:
+            if not self.connected:
+                log_message("Cannot ensure database exists - not connected", True)
+                return False
+            
+            # First, connect to the system database to check/create our database
+            with self.driver.session(database="system") as session:
+                # Check if our database exists
+                result = session.run("SHOW DATABASES YIELD name WHERE name = $db_name", db_name=self.database)
+                exists = result.single() is not None
+                
+                if not exists:
+                    log_message(f"Creating database: {self.database}")
+                    # Create the database
+                    session.run("CREATE DATABASE $db_name", db_name=self.database)
+                    log_message(f"Database {self.database} created successfully")
+                else:
+                    log_message(f"Database {self.database} already exists")
+            
+            return True
+        except Exception as e:
+            log_message(f"Error ensuring database exists: {str(e)}", True)
+            return False
 
     def initialize_vector_store(self, embeddings):
         """Initialize the vector store with Neo4j integration"""
@@ -3512,6 +3538,9 @@ class ResearchAssistantApp(wx.Frame):
                                 if self.neo4j_manager.connect():
                                     log_message("Connected to Neo4j database successfully")
                                     
+                                    # Ensure the database exists
+                                    self.neo4j_manager.ensure_database_exists()
+                                    
                                     # Initialize embeddings
                                     self.initialize_embeddings()
                                     
@@ -3519,8 +3548,7 @@ class ResearchAssistantApp(wx.Frame):
                                     timeout.cancel()
                                     
                                     # Signal that initialization is complete
-                                    if hasattr(self, 'db_init_complete_callback') and self.db_init_complete_callback:
-                                        wx.PostEvent(self, DbInitEvent(success=True))
+                                    wx.PostEvent(self, DbInitEvent(success=True))
                                     
                                     return True
                                 else:
@@ -5377,11 +5405,13 @@ class ResearchAssistantApp(wx.Frame):
             neo4j_docs = []
             try:
                 neo4j_doc_tuples = self.neo4j_manager.get_document_list()
-                # Convert tuples to formatted strings
+                # Only show documents that are in self.documents (current pair's uploaded docs)
+                uploaded_titles = set(self.documents.keys())
                 for doc_tuple in neo4j_doc_tuples:
                     if isinstance(doc_tuple, tuple) and len(doc_tuple) >= 2:
                         doc_id, title = doc_tuple[0], doc_tuple[1]
-                        neo4j_docs.append(f"ID: {doc_id} - Title: {title}")
+                        if title in uploaded_titles:
+                            neo4j_docs.append(f"ID: {doc_id} - Title: {title}")
                     else:
                         neo4j_docs.append(str(doc_tuple))
             except Exception as e:
