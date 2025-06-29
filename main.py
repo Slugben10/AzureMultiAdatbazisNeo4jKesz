@@ -5376,7 +5376,14 @@ class ResearchAssistantApp(wx.Frame):
             # Get documents from Neo4j
             neo4j_docs = []
             try:
-                neo4j_docs = self.neo4j_manager.get_document_list()
+                neo4j_doc_tuples = self.neo4j_manager.get_document_list()
+                # Convert tuples to formatted strings
+                for doc_tuple in neo4j_doc_tuples:
+                    if isinstance(doc_tuple, tuple) and len(doc_tuple) >= 2:
+                        doc_id, title = doc_tuple[0], doc_tuple[1]
+                        neo4j_docs.append(f"ID: {doc_id} - Title: {title}")
+                    else:
+                        neo4j_docs.append(str(doc_tuple))
             except Exception as e:
                 neo4j_docs = [f"Error accessing Neo4j: {str(e)}"]
             
@@ -5385,11 +5392,14 @@ class ResearchAssistantApp(wx.Frame):
             message += "Vector Database Documents:\n"
             message += "- " + "\n- ".join(vector_docs) + "\n\n"
             message += "Neo4j Graph Database Documents:\n"
-            message += "- " + "\n- ".join(neo4j_docs)
+            if neo4j_docs:
+                message += "- " + "\n- ".join(neo4j_docs)
+            else:
+                message += "- No documents found"
             
             # Show in a dialog
             with wx.TextEntryDialog(self, message, "Database Documents", 
-                                  style=wx.TE_MULTILINE | wx.TE_READONLY, size=(600, 400)) as dlg:
+                                  style=wx.TE_MULTILINE | wx.TE_READONLY) as dlg:
                 dlg.ShowModal()
                 
         except Exception as e:
