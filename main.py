@@ -2919,11 +2919,39 @@ class SettingsDialog(wx.Dialog):
                     endpoint_ctrl.SetHint("https://your-resource-name.openai.azure.com/")
                     model_sizer.Add(endpoint_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
                     
+
+                       # Model Name
+                    model_name_label = wx.StaticText(model_panel, label="Model Name:")
+                    model_sizer.Add(model_name_label, 0, wx.BOTTOM, 5)
+                    self.azure_model_name_ctrl = wx.TextCtrl(model_panel)
+                    self.azure_model_name_ctrl.SetValue(model_config.get("model_name", ""))
+                    model_sizer.Add(self.azure_model_name_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
+
+   # Deployment Name
+                    deployment_name_label = wx.StaticText(model_panel, label="Deployment Name:")
+                    model_sizer.Add(deployment_name_label, 0, wx.BOTTOM, 5)
+                    self.azure_deployment_name_ctrl = wx.TextCtrl(model_panel)
+                    self.azure_deployment_name_ctrl.SetValue(model_config.get("deployment_name", ""))
+                    model_sizer.Add(self.azure_deployment_name_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
+
+   # Embedding Deployment
+                    embedding_deployment_label = wx.StaticText(model_panel, label="Embedding Deployment:")
+                    model_sizer.Add(embedding_deployment_label, 0, wx.BOTTOM, 5)
+                    self.azure_embedding_deployment_ctrl = wx.TextCtrl(model_panel)
+                    self.azure_embedding_deployment_ctrl.SetValue(model_config.get("embedding_deployment", ""))
+                    model_sizer.Add(self.azure_embedding_deployment_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
                     # Environment variable name for endpoint
                     endpoint_env_name = model_config.get("api_base_env", "")
                     endpoint_env_label = wx.StaticText(model_panel, label=f"Environment Variable: {endpoint_env_name}")
                     endpoint_env_label.SetFont(font)  # Reuse the small font
                     model_sizer.Add(endpoint_env_label, 0, wx.BOTTOM, 15)
+
+                    # API Version
+                    api_version_label = wx.StaticText(model_panel, label="API Version:")
+                    model_sizer.Add(api_version_label, 0, wx.BOTTOM, 5)
+                    self.azure_api_version_ctrl = wx.TextCtrl(model_panel)
+                    self.azure_api_version_ctrl.SetValue(model_config.get("api_version", ""))
+                    model_sizer.Add(self.azure_api_version_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
                     
                     # Store reference to the endpoint control
                     self.api_endpoint_ctrls[model_key] = endpoint_ctrl
@@ -3022,6 +3050,21 @@ class SettingsDialog(wx.Dialog):
                     if api_base_env and endpoint:
                         os.environ[api_base_env] = endpoint
                         log_message(f"Updated API endpoint for {model_key}")
+
+
+                           # Save Azure model settings
+                    if (
+                        self.azure_model_name_ctrl
+                        and self.azure_deployment_name_ctrl
+                        and self.azure_embedding_deployment_ctrl
+                        and self.azure_api_version_ctrl
+                    ):
+                        azure_config = self.config["models"].get("azure", {})
+                        azure_config["model_name"] = self.azure_model_name_ctrl.GetValue().strip()
+                        azure_config["deployment_name"] = self.azure_deployment_name_ctrl.GetValue().strip()
+                        azure_config["embedding_deployment"] = self.azure_embedding_deployment_ctrl.GetValue().strip()
+                        azure_config["api_version"] = self.azure_api_version_ctrl.GetValue().strip()
+                        self.config["models"]["azure"] = azure_config
         
         # Save system prompt to config
         system_prompt = self.system_prompt_ctrl.GetValue().strip()
