@@ -5137,10 +5137,10 @@ class ResearchAssistantApp(wx.Frame):
             self.append_streaming_chunk(event.text)
             
             # Add to the current streaming response
-            if hasattr(self, 'current_streaming_response'):
-                self.current_streaming_response += event.text
-            else:
-                self.current_streaming_response = event.text
+            # Add to the current streaming response
+            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
+                self.current_streaming_response = ""
+            self.current_streaming_response += event.text
                 
             # Ensure UI is updated immediately
             wx.GetApp().Yield()
