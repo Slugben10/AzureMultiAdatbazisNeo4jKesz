@@ -1,3 +1,4 @@
+import time
 #import hide_console  # This will hide all console windows
 import os
 import json
@@ -22,6 +23,7 @@ import select
 import importlib
 import uuid
 import tempfile
+import time
 
 # Define a function to check if a package is installed
 def check_package_installed(package_name):
@@ -198,9 +200,9 @@ except ImportError:
     log_message(
         "Warning: embedding packages not installed. Vector functionality will be limited.", True)
 
-# Neo4j Database Manager class - moved here to be available globally
+
 class Neo4jDatabaseManager:
-    def __init__(self, uri="bolt://localhost:7687", username="neo4j", password="neo4j_password", database="neo4j", show_ui=True):
+    def __init__(self, uri="bolt://localhost:7687", username="neo4j", password="neo4j_password", database="neo4j", show_ui=True, db_name=None):
         self.uri = uri
         self.username = username
         self.password = password
@@ -210,11 +212,14 @@ class Neo4jDatabaseManager:
         self.vector_store = None
         self.embeddings = None
         self.connected = False
+        self.db_name = db_name
         
         # Create a file to store the password
         self.auth_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neo4j_auth.json")
         self._load_or_create_auth()
         self.connect()
+        # PATCH: Clean up any old Document nodes without db_name for strict isolation
+        self.cleanup_old_documents_without_db_name()
 
     def _load_or_create_auth(self):
         """Load existing auth info or create new one"""
@@ -290,7 +295,7 @@ class Neo4jDatabaseManager:
                     )
                     
                     # If we can connect with default password, change it
-                    with self.driver.session(database="system") as session:
+                    with self.driver.session(database=self.database) as session:
                         session.run(
                             "ALTER CURRENT USER SET PASSWORD FROM $old_pw TO $new_pw",
                             old_pw="neo4j",
@@ -353,7 +358,7 @@ class Neo4jDatabaseManager:
                 return False
             
             # First, connect to the system database to check/create our database
-            with self.driver.session(database="system") as session:
+            with self.driver.session(database=self.database) as session:
                 # Check if our database exists
                 result = session.run("SHOW DATABASES YIELD name WHERE name = $db_name", db_name=self.database)
                 exists = result.single() is not None
@@ -377,29 +382,36 @@ class Neo4jDatabaseManager:
             if not LANGCHAIN_AVAILABLE or not self.connected:
                 log_message("LangChain or Neo4j connection not available", True)
                 return False
-                
             # For Neo4j 4.x compatibility, we'll use a more basic approach
             log_message("Initializing Neo4j vector store (Neo4j 4.x compatible mode)")
-            
-            # Create the necessary schema using the Neo4j driver directly
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 # Create constraint if it doesn't exist (Neo4j 4.x syntax)
                 try:
                     session.run("""
-                    CREATE CONSTRAINT ON (d:Document) 
-                    ASSERT d.document_id IS UNIQUE
+                    CREATE CONSTRAINT FOR (d:Document) REQUIRE (d.document_id, d.db_name) IS UNIQUE
                     """)
-                    log_message("Created document ID constraint")
+                    log_message("Created document ID+db_name composite constraint")
                 except Exception as e:
-                    # If the constraint already exists, just log and continue
                     if "EquivalentSchemaRuleAlreadyExists" in str(e):
-                        log_message("Document ID constraint already exists", True)
+                        log_message("Document ID+db_name composite constraint already exists", True)
                     else:
-                        # If it's some other error, log it but continue
                         log_message(f"Warning creating constraint: {str(e)}", True)
-                
+                # Create full-text index for __Entity__ nodes (db_name, name, id, title)
+                try:
+                    session.run("""
+                    CALL db.index.fulltext.createNodeIndex(
+                        'entityFullTextIndex',
+                        ['__Entity__'],
+                        ['db_name', 'name', 'id', 'title']
+                    )
+                    """)
+                    log_message("Created full-text index on __Entity__ (db_name, name, id, title)")
+                except Exception as e:
+                    if "An equivalent index already exists" in str(e):
+                        log_message("Full-text index already exists", True)
+                    else:
+                        log_message(f"Error creating full-text index: {str(e)}", True)
                 # Create a simple node to ensure we have at least one node in the graph
-                # This helps when initializing from an existing graph
                 try:
                     session.run("""
                     MERGE (d:Document {document_id: 'placeholder', content: 'Initial placeholder document'})
@@ -407,7 +419,6 @@ class Neo4jDatabaseManager:
                     log_message("Created placeholder document node")
                 except Exception as e:
                     log_message(f"Warning creating placeholder: {str(e)}", True)
-                
             # Create our custom Neo4j vector store implementation compatible with Neo4j 4.x
             from langchain_core.documents import Document
             from langchain_core.vectorstores import VectorStore
@@ -415,10 +426,11 @@ class Neo4jDatabaseManager:
             class Neo4jVectorStore4x(VectorStore):
                 """Custom Neo4j Vector Store for Neo4j 4.x compatibility"""
                 
-                def __init__(self, driver, embedding_function, database="neo4j"):
+                def __init__(self, driver, embedding_function, database="neo4j", db_name=None):
                     self.driver = driver
                     self.embedding_function = embedding_function
                     self.database = database
+                    self.db_name = db_name
                 
                 def add_documents(self, documents):
                     """Add documents to the vector store with batch processing for better performance"""
@@ -496,7 +508,7 @@ class Neo4jDatabaseManager:
                                 
                                 # Now process the batch in one session
                                 if embeddings_batch:
-                                    with self.driver.session() as session:
+                                    with self.driver.session(database=self.database) as session:
                                         # Create a transaction function to process the entire batch
                                         def create_documents_tx(tx):
                                             successful = 0
@@ -508,7 +520,7 @@ class Neo4jDatabaseManager:
                                                 try:
                                                     # Create document node with embedding
                                                     tx.run("""
-                                                    MERGE (d:Document {document_id: $doc_id})
+                                                    MERGE (d:Document {document_id: $doc_id, db_name: $db_name})
                                                     SET d.content = $content,
                                                         d.title = $title,
                                                         d.embedding = $embedding
@@ -516,13 +528,14 @@ class Neo4jDatabaseManager:
                                                     doc_id=metadata["document_id"], 
                                                     content=metadata["content"], 
                                                     title=metadata["title"], 
-                                                    embedding=embeddings_batch[idx])
+                                                    embedding=embeddings_batch[idx],
+                                                    db_name=self.db_name)
                                                     
                                                     # Add metadata as properties in a single query
                                                     if metadata["raw_metadata"]:
                                                         # Build SET clauses dynamically
                                                         set_clauses = []
-                                                        params = {"doc_id": metadata["document_id"]}
+                                                        params = {"doc_id": metadata["document_id"], "db_name": self.db_name}
                                                         
                                                         for meta_key, meta_value in metadata["raw_metadata"].items():
                                                             param_name = f"meta_{meta_key}_{idx}"
@@ -531,7 +544,7 @@ class Neo4jDatabaseManager:
                                                         
                                                         if set_clauses:
                                                             meta_query = f"""
-                                                            MATCH (d:Document {{document_id: $doc_id}})
+                                                            MATCH (d:Document {{document_id: $doc_id, db_name: $db_name}})
                                                             SET {', '.join(set_clauses)}
                                                             """
                                                             tx.run(meta_query, **params)
@@ -564,9 +577,9 @@ class Neo4jDatabaseManager:
                         return []
                     
                     # In Neo4j 4.x without GDS, we'll implement a basic vector similarity using Cypher
-                    with self.driver.session() as session:
+                    with self.driver.session(database=self.database) as session:
                         result = session.run("""
-                        MATCH (d:Document) 
+                        MATCH (d:Document {db_name: $db_name})
                         WHERE d.embedding IS NOT NULL
                         WITH d, 
                              REDUCE(dot = 0.0, i IN RANGE(0, SIZE(d.embedding) - 1) | 
@@ -578,7 +591,7 @@ class Neo4jDatabaseManager:
                         ORDER BY score DESC 
                         LIMIT $k
                         RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, score
-                        """, query_embedding=query_embedding, k=k)
+                        """, query_embedding=query_embedding, k=k, db_name=self.db_name)
                         
                         # Convert results to Document objects
                         documents = []
@@ -624,7 +637,7 @@ class Neo4jDatabaseManager:
                     return VectorStoreRetriever(vectorstore=self, **kwargs)
                 
                 @classmethod
-                def from_texts(cls, texts, embedding, metadatas=None, **kwargs):
+                def from_texts(cls, texts, embedding, metadatas=None, db_name=None, **kwargs):
                     """Create a Neo4jVectorStore4x from a list of texts."""
                     # Process driver from kwargs
                     driver = kwargs.get("driver", None)
@@ -647,7 +660,8 @@ class Neo4jDatabaseManager:
                     vs = cls(
                         driver=driver,
                         embedding_function=embedding,
-                        database=kwargs.get("database", "neo4j")
+                        database=kwargs.get("database", "neo4j"),
+                        db_name=db_name
                     )
                     
                     # Add texts if provided
@@ -656,10 +670,12 @@ class Neo4jDatabaseManager:
                     
                     return vs
             
-            # Initialize the vector store with our embedding function
+            # Initialize the vector store with our embedding function and db_name
             self.vector_store = Neo4jVectorStore4x(
                 driver=self.driver,
-                embedding_function=embeddings
+                embedding_function=embeddings,
+                database=self.database,
+                db_name=self.db_name
             )
             
             log_message("Vector store initialized successfully (Neo4j 4.x compatibility mode)")
@@ -675,7 +691,8 @@ class Neo4jDatabaseManager:
             if not self.connected:
                 log_message("Not connected to Neo4j", True)
                 return False
-            
+            # Use the logical db_name for isolation
+            logical_db_name = self.db_name if self.db_name else self.database
             # Create safe metadata - ensure it contains only primitive types
             safe_metadata = {}
             if metadata:
@@ -686,9 +703,8 @@ class Neo4jDatabaseManager:
                     else:
                         # Convert complex objects to string representation
                         safe_metadata[k] = str(v)
-            
             # STEP 1: Add to Neo4j graph database with a single transaction
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 def create_document_tx(tx):
                     # Create the document node with all metadata in one operation
                     metadata_props = {f"meta_{k}": v for k, v in safe_metadata.items()}
@@ -698,22 +714,17 @@ class Neo4jDatabaseManager:
                         "content": content,
                         "priority": safe_metadata.get("priority", "Medium"),
                         "updated_at": "datetime()",  # Will be evaluated by Neo4j
+                        "db_name": logical_db_name,
                         **metadata_props
                     }
-                    
-                    # Build a dynamic query for creating the document with all properties
-                    properties_str = ", ".join([f"{k}: ${k}" for k in all_props.keys()])
-                    query = f"""
-                    MERGE (d:Document {{document_id: $document_id}})
-                    SET d = {{ {properties_str} }}
-                    """
-                    
-                    # Execute the query with all properties
-                    tx.run(query, **all_props)
-                    
+                    # Use a plain string for the Cypher query and SET d += $all_props
+                    query = '''
+                    MERGE (d:Document {document_id: $document_id, db_name: $db_name})
+                    SET d += $all_props
+                    '''
+                    tx.run(query, document_id=document_id, db_name=logical_db_name, all_props=all_props)
                     log_message(f"Created document node with {len(metadata_props)} metadata properties")
                     return True
-                
                 # Execute the transaction
                 session.write_transaction(create_document_tx)
             
@@ -751,12 +762,57 @@ class Neo4jDatabaseManager:
                     log_message(f"Error adding document to vector store: {str(e)}", True)
                     # Continue even if vector store addition fails - we still have the graph data
             
+            # STEP 2.5: Add Chunk nodes and PART_OF relationships to Neo4j
+            try:
+                # Use the same chunking as for the vector store
+                from langchain.text_splitter import RecursiveCharacterTextSplitter
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=800,
+                    chunk_overlap=50
+                )
+                lc_metadata = safe_metadata.copy()
+                lc_metadata["document_id"] = document_id
+                lc_metadata["title"] = title
+                docs = text_splitter.create_documents(
+                    texts=[content],
+                    metadatas=[lc_metadata]
+                )
+                with self.driver.session(database=self.database) as session:
+                    def create_chunks_tx(tx):
+                        for i, chunk in enumerate(docs):
+                            chunk_id = f"{document_id}_{i}"
+                            tx.run(
+                                """
+                                MERGE (c:Chunk {chunk_id: $chunk_id, db_name: $db_name})
+                                SET c.content = $content,
+                                    c.title = $title,
+                                    c.document_id = $document_id
+                                WITH c
+                                MATCH (d:Document {document_id: $document_id, db_name: $db_name})
+                                MERGE (c)-[:PART_OF]->(d)
+                                """,
+                                chunk_id=chunk_id,
+                                db_name=logical_db_name,
+                                content=chunk.page_content,
+                                title=title,
+                                document_id=document_id
+                            )
+                    session.write_transaction(create_chunks_tx)
+                log_message(f"Added {len(docs)} Chunk nodes for document {document_id}")
+            except Exception as e:
+                log_message(f"Error creating Chunk nodes: {str(e)}", True)
+            
             # STEP 3: Add to knowledge graph (optimized version)
             start_time = time.time()
             try:
                 graph_success = self.add_document_to_knowledge_graph(document_id, title, content, safe_metadata)
                 duration = time.time() - start_time
                 log_message(f"Knowledge graph processing completed in {duration:.2f} seconds")
+                # PATCH: Neo4j 4.x workaround: wait for full-text index to update
+                
+                log_message("Waiting for full-text index to update (Neo4j 4.x workaround)...")
+                time.sleep(3)
+                log_message("Waited 3 seconds for full-text index update")
             except Exception as e:
                 log_message(f"Error in knowledge graph processing: {str(e)}", True)
                 graph_success = False
@@ -780,10 +836,11 @@ class Neo4jDatabaseManager:
                 return False
                 
             # Check if document exists
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 result = session.run(
-                    "MATCH (d:Document {document_id: $id}) RETURN count(d) AS count",
-                    id=document_id
+                    "MATCH (d:Document {document_id: $id, db_name: $db_name}) RETURN count(d) AS count",
+                    id=document_id,
+                    db_name=self.database
                 )
                 doc_exists = result.single()["count"] > 0
                 
@@ -792,14 +849,15 @@ class Neo4jDatabaseManager:
                 return False
             
             # STEP 1: Remove from Neo4j database
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 # Delete document node and relationships
                 session.run(
                     """
-                    MATCH (d:Document {document_id: $id})
+                    MATCH (d:Document {document_id: $id, db_name: $db_name})
                     DETACH DELETE d
                     """,
-                    id=document_id
+                    id=document_id,
+                    db_name=self.database
                 )
                 
             # STEP 2: If using vector store, remove from there too
@@ -821,14 +879,14 @@ class Neo4jDatabaseManager:
                 return False
 
             # STEP 1: Delete all documents from Neo4j database
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 # Delete all document nodes and their relationships
                 # Exclude the placeholder document
                 session.run("""
-                    MATCH (d:Document)
+                    MATCH (d:Document {db_name: $db_name})
                     WHERE d.document_id <> 'placeholder'
                     DETACH DELETE d
-                """)
+                """, db_name=self.database)
                 log_message("Deleted all documents from Neo4j database")
 
             # STEP 2: Reinitialize vector store to clear it
@@ -857,12 +915,12 @@ class Neo4jDatabaseManager:
         try:
             with self.driver.session(database=self.database) as session:
                 result = session.run("""
-                    MATCH (d:Document)
+                    MATCH (d:Document {db_name: $db_name})
                     WHERE d.title IS NOT NULL AND d.title <> 'None' AND d.document_id <> 'placeholder'
                     RETURN d.document_id as id, d.title as title, COUNT((d)-[:CONTAINS]->()) as chunks, 
                            d.priority as priority
                     ORDER BY d.title
-                """)
+                """, db_name=self.database)
                 return [(record["id"], record["title"], record["chunks"], 
                          record["priority"] if record["priority"] is not None else "Medium") 
                         for record in result]
@@ -870,163 +928,131 @@ class Neo4jDatabaseManager:
             log_message(f"Error getting document list: {str(e)}", True)
             return []
     
-    def query_similar_text(self, query, limit=5, use_graph=False):
-        """Query for similar text chunks using vector store or graph relationships
-        
-        Args:
-            query: The text to find similar documents to
-            limit: Maximum number of results to return
-            use_graph: If True, use graph relationships for search; otherwise use vector embedding
+    def query_similar_text(self, query, limit=5, use_graph=False, filters=None):
+        """
+        Query for similar text chunks using vector store or graph relationships,
+        with advanced metadata filtering and strict db_name isolation.
         """
         try:
             if not self.connected:
                 log_message("Neo4j connection not available", True)
                 return []
-            
-            # METHOD 1: Using Vector Store for semantic search (standard RAG)
+            # Use the logical db_name for isolation (not the physical database name)
+            logical_db_name = self.db_name if self.db_name else self.database
+            # Build dynamic filter clause for Cypher
+            filter_clauses = []
+            params = {"query": query.lower(), "limit": limit, "db_name": logical_db_name}
+            if filters:
+                for key, value in filters.items():
+                    filter_clauses.append(f"d.{key} = ${{key}}")
+                    params[key] = value
+            filter_str = " AND ".join(filter_clauses)
+            if filter_str:
+                filter_str = " AND " + filter_str
+            # METHOD 1: Vector search (unchanged)
             if not use_graph and self.vector_store:
                 try:
-                    # Query for similar text using embeddings
-                    results = self.vector_store.similarity_search(
-                        query=query,
-                        k=limit
-                    )
-                    
+                    results = self.vector_store.similarity_search(query=query, k=limit)
                     log_message(f"Found {len(results)} similar documents using vector search")
-                    
-                    # Apply priority sorting to the retrieved documents if running in an app context
+                    # Priority sorting as before
                     if hasattr(wx.GetApp(), 'document_priorities'):
                         app = wx.GetApp()
                         priority_values = {"High": 3, "Medium": 2, "Low": 1}
-                        
-                        # Add priority score to each document's metadata
                         for doc in results:
-                            # First check if priority is already in the metadata (from database)
-                            if "priority" in doc.metadata:
-                                priority = doc.metadata["priority"]
-                            else:
-                                # Get the title from metadata which should be the filename
-                                title = doc.metadata.get("title", "")
-                                
-                                # Get priority from app's priorities or default to Medium
-                                priority = app.document_priorities.get(title, "Medium")
-                            
+                            priority = doc.metadata.get("priority", app.document_priorities.get(doc.metadata.get("title", ""), "Medium"))
                             priority_value = priority_values.get(priority, 2)
                             doc.metadata["priority_value"] = priority_value
                             doc.metadata["priority"] = priority
-                        
-                        # Sort by priority (higher first), then by similarity score
-                        results = sorted(results, 
-                                         key=lambda doc: (doc.metadata.get("priority_value", 2), 
-                                                         doc.metadata.get("score", 0.0)), 
-                                         reverse=True)
-                    
+                        results = sorted(results, key=lambda doc: (doc.metadata.get("priority_value", 2), doc.metadata.get("score", 0.0)), reverse=True)
                     return results
                 except Exception as e:
                     log_message(f"Error querying vector store: {str(e)}", True)
-                    # Fall back to graph search if vector search fails
-            
-            # METHOD 2: Using Graph Relationships (GraphRAG approach)
-            with self.driver.session() as session:
+            # METHOD 2: Graph search (NOT filtered by user query)
+            with self.driver.session(database=self.database) as session:
                 if use_graph:
-                    # For graph search, retrieve documents with relevant entities or matching content
-                    # First retrieve all documents as a simpler approach
                     try:
-                        # Simple query to get all documents except the placeholder
-                        result = session.run("""
-                        MATCH (d:Document)
-                        WHERE d.document_id <> 'placeholder'
-                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, 1 AS score
-                        LIMIT $limit
-                        """, limit=limit)
-                        
-                        # Process results
+                        # Neo4j 4.x compatible: For each document, find the chunk with the highest degree (most connected), no APOC, no window functions
+                        cypher = (
+                            "MATCH (d:Document {db_name: $db_name})\n"
+                            "WHERE d.document_id <> 'placeholder'\n"
+                            "CALL {\n"
+                            "  WITH d\n"
+                            "  MATCH (c:Chunk {db_name: $db_name})-[:PART_OF]->(d)\n"
+                            "  OPTIONAL MATCH (c)-[:CONTAINS]->(e:__Entity__ {db_name: $db_name})\n"
+                            "  WITH c, collect(DISTINCT coalesce(e.name, e.id, e.title)) AS related_entities, size((c)--()) AS degree\n"
+                            "  ORDER BY degree DESC\n"
+                            "  RETURN c, related_entities, degree\n"
+                            "  LIMIT 1\n"
+                            "}\n"
+                            "RETURN d, c, related_entities, degree\n"
+                            "ORDER BY degree DESC\n"
+                            "LIMIT $limit\n"
+                        )
+                        log_message("Running graph search Cypher query (top chunk per document, Neo4j 4.x, no APOC):")
+                        log_message(f"Cypher: {cypher}")
+                        log_message(f"Params: {params}")
+                        result = session.run(cypher, params)
+                        raw_records = list(result)
+                        log_message(f"Raw records returned: {len(raw_records)}")
+                        for i, record in enumerate(raw_records):
+                            log_message(f"Record {i}: {record}")
+                        # Process results with metadata enrichment for chunk and document
                         try:
                             from langchain_core.documents import Document
                         except ImportError:
                             log_message("langchain_core.documents not available, using custom Document class", True)
-                            # Define a simple Document class to mimic LangChain's Document
                             class Document:
                                 def __init__(self, page_content, metadata=None):
                                     self.page_content = page_content
                                     self.metadata = metadata or {}
-                        
                         documents = []
-                        
-                        for record in result:
-                            # Create metadata
-                            metadata = {
-                                "document_id": record["document_id"],
-                                "title": record["title"],
-                                "score": record["score"],
-                                "priority": record["priority"] if record["priority"] is not None else "Medium",
-                                "source": "graph_search"
-                            }
-                            
-                            # Create Document
+                        for record in raw_records:
+                            d = record["d"]
+                            c = record["c"]
+                            metadata = dict(d)
+                            metadata.update({k: v for k, v in c.items() if k not in metadata})
+                            metadata["related_entities"] = record.get("related_entities", [])
+                            metadata["score"] = record["degree"]
+                            metadata["source"] = "graph_search"
+                            log_message(f"[GRAPH SEARCH RESULT] Title: {metadata.get('title')}, Document ID: {metadata.get('document_id')}, Chunk ID: {c.get('chunk_id')}, db_name: {metadata.get('db_name')}")
                             doc = Document(
-                                page_content=record["content"],
+                                page_content=c.get("content", ""),
                                 metadata=metadata
                             )
                             documents.append(doc)
-                        
-                        # Apply priority sorting to the retrieved documents if running in an app context
+                        # Priority sorting as before
                         if hasattr(wx.GetApp(), 'document_priorities'):
                             app = wx.GetApp()
                             priority_values = {"High": 3, "Medium": 2, "Low": 1}
-                            
-                            # Add priority score to each document's metadata
                             for doc in documents:
-                                # First check if priority is already in the metadata (from database)
-                                if "priority" in doc.metadata:
-                                    priority = doc.metadata["priority"]
-                                else:
-                                    # Get the title from metadata which should be the filename
-                                    title = doc.metadata.get("title", "")
-                                    
-                                    # Get priority from app's priorities or default to Medium
-                                    priority = app.document_priorities.get(title, "Medium")
-                                
+                                priority = doc.metadata.get("priority", app.document_priorities.get(doc.metadata.get("title", ""), "Medium"))
                                 priority_value = priority_values.get(priority, 2)
                                 doc.metadata["priority_value"] = priority_value
                                 doc.metadata["priority"] = priority
-                            
-                            # Sort by priority (higher first), then by similarity score
-                            documents = sorted(documents, 
-                                             key=lambda doc: (doc.metadata.get("priority_value", 2), 
-                                                             doc.metadata.get("score", 0.0)), 
-                                             reverse=True)
-                        
-                        log_message(f"Found {len(documents)} similar documents using graph search")
+                            documents = sorted(documents, key=lambda doc: (doc.metadata.get("priority_value", 2), doc.metadata.get("score", 0.0)), reverse=True)
+                        log_message(f"Found {len(documents)} similar documents using graph search (top chunk per document, Neo4j 4.x, no APOC)")
                         return documents
                     except Exception as e:
                         log_message(f"Error in graph document retrieval: {str(e)}", True)
                         return []
                 else:
-                    # If vector store is not available but use_graph is False,
-                    # run a basic full-text search in Neo4j as fallback
+                    # Fallback: basic full-text search in Neo4j
                     result = session.run("""
-                    MATCH (d:Document)
+                    MATCH (d:Document {db_name: $db_name})
                     WHERE d.document_id <> 'placeholder' AND toLower(d.content) CONTAINS toLower($query)
                     RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, 1 AS score
                     LIMIT $limit
-                    """, query=query, limit=limit)
-                    
-                    # Process results
+                    """, {"query": query, "limit": limit, "db_name": logical_db_name})
                     try:
                         from langchain_core.documents import Document
                     except ImportError:
                         log_message("langchain_core.documents not available, using custom Document class", True)
-                        # Define a simple Document class to mimic LangChain's Document
                         class Document:
                             def __init__(self, page_content, metadata=None):
                                 self.page_content = page_content
                                 self.metadata = metadata or {}
-                    
                     documents = []
-                    
                     for record in result:
-                        # Create metadata
                         metadata = {
                             "document_id": record["document_id"],
                             "title": record["title"],
@@ -1034,41 +1060,21 @@ class Neo4jDatabaseManager:
                             "priority": record["priority"] if record["priority"] is not None else "Medium",
                             "source": "text_search"
                         }
-                        
-                        # Create Document
                         doc = Document(
                             page_content=record["content"],
                             metadata=metadata
                         )
                         documents.append(doc)
-                    
-                    # Apply priority sorting to the retrieved documents if running in an app context
+                    # Priority sorting as before
                     if hasattr(wx.GetApp(), 'document_priorities'):
                         app = wx.GetApp()
                         priority_values = {"High": 3, "Medium": 2, "Low": 1}
-                        
-                        # Add priority score to each document's metadata
                         for doc in documents:
-                            # First check if priority is already in the metadata (from database)
-                            if "priority" in doc.metadata:
-                                priority = doc.metadata["priority"]
-                            else:
-                                # Get the title from metadata which should be the filename
-                                title = doc.metadata.get("title", "")
-                                
-                                # Get priority from app's priorities or default to Medium
-                                priority = app.document_priorities.get(title, "Medium")
-                            
+                            priority = doc.metadata.get("priority", app.document_priorities.get(doc.metadata.get("title", ""), "Medium"))
                             priority_value = priority_values.get(priority, 2)
                             doc.metadata["priority_value"] = priority_value
                             doc.metadata["priority"] = priority
-                        
-                        # Sort by priority (higher first), then by similarity score
-                        documents = sorted(documents, 
-                                         key=lambda doc: (doc.metadata.get("priority_value", 2), 
-                                                         doc.metadata.get("score", 0.0)), 
-                                         reverse=True)
-                    
+                        documents = sorted(documents, key=lambda doc: (doc.metadata.get("priority_value", 2), doc.metadata.get("score", 0.0)), reverse=True)
                     log_message(f"Found {len(documents)} documents using text search (fallback)")
                     return documents
         except Exception as e:
@@ -1086,11 +1092,11 @@ class Neo4jDatabaseManager:
                 properties = {}
                 
             # Create relationship
-            with self.driver.session() as session:
+            with self.driver.session(database=self.database) as session:
                 result = session.run(
                     """
-                    MATCH (source:Document {document_id: $source_id})
-                    MATCH (target:Document {document_id: $target_id})
+                    MATCH (source:Document {document_id: $source_id, db_name: $db_name})
+                    MATCH (target:Document {document_id: $target_id, db_name: $db_name})
                     WITH source, target
                     MERGE (source)-[r:RELATED_TO]->(target)
                     SET r.type = $rel_type,
@@ -1100,7 +1106,8 @@ class Neo4jDatabaseManager:
                     source_id=source_id,
                     target_id=target_id,
                     rel_type=relationship_type,
-                    properties=properties
+                    properties=properties,
+                    db_name=self.database
                 )
                 
                 created = result.single()["count"] > 0
@@ -1145,13 +1152,13 @@ class Neo4jDatabaseManager:
                 log_message(f"Some required libraries for knowledge graph are missing: {', '.join(missing_libs)}", True)
                 log_message("Knowledge graph features will be limited. Document will still be available for vector search.", True)
                 # We'll still create the base document node so it can be found by vector search
-                with self.driver.session() as session:
+                with self.driver.session(database=self.database) as session:
                     session.run("""
-                    MERGE (d:Document {document_id: $doc_id})
+                    MERGE (d:Document {document_id: $doc_id, db_name: $db_name})
                     SET d.title = $title,
                         d.content = $content,
                         d.updated_at = datetime()
-                    """, doc_id=document_id, title=title, content=content)
+                    """, doc_id=document_id, title=title, content=content, db_name=self.database)
                     log_message("Created placeholder document node")
                 return False
                 
@@ -1223,13 +1230,13 @@ class Neo4jDatabaseManager:
                     log_message(f"Error initializing Ollama LLM: {str(ollama_err)}", True)
                     log_message("No suitable LLM available for graph transformation", True)
                     # Still create the document node at minimum
-                    with self.driver.session() as session:
+                    with self.driver.session(database=self.database) as session:
                         session.run("""
-                        MERGE (d:Document {document_id: $doc_id})
+                        MERGE (d:Document {document_id: $doc_id, db_name: $db_name})
                         SET d.title = $title,
                             d.content = $content,
                             d.updated_at = datetime()
-                        """, doc_id=document_id, title=title, content=content)
+                        """, doc_id=document_id, title=title, content=content, db_name=self.database)
                         log_message("Created placeholder document node")
                     return False
             
@@ -1303,85 +1310,91 @@ class Neo4jDatabaseManager:
                                 log_message(f"  - Relationship {j}: Type: {rel.type}, Source: {rel.source.id if hasattr(rel.source, 'id') else 'Unknown'}, Target: {rel.target.id if hasattr(rel.target, 'id') else 'Unknown'}")
                     
                     # Add to graph database with batch processing
-                    with self.driver.session() as session:
+                    with self.driver.session(database=self.database) as session:
                         # First, create the base document node to connect everything
                         session.run("""
-                        MERGE (d:Document {document_id: $doc_id})
+                        MERGE (d:Document {document_id: $doc_id, db_name: $db_name})
                         SET d.title = $title,
                             d.content = $content,
                             d.updated_at = datetime()
-                        """, doc_id=document_id, title=title, content=content)
+                        """, doc_id=document_id, title=title, content=content, db_name=self.database)
                         
                         # Create relationships to other documents (simple ALL_DOCUMENTS relationship)
                         # This ensures that all documents are connected in the graph
                         session.run("""
-                        MATCH (d:Document {document_id: $doc_id})
-                        MATCH (other:Document)
+                        MATCH (d:Document {db_name: $db_name})
+                        MATCH (other:Document {db_name: $db_name})
                         WHERE other.document_id <> $doc_id AND other.document_id <> 'placeholder'
                         WITH d, other
                         LIMIT 100
                         MERGE (d)-[:ALL_DOCUMENTS]->(other)
-                        """, doc_id=document_id)
+                        """, doc_id=document_id, db_name=self.database)
                         
                         # Process graph documents - use transactions for batching
-                        def create_kg_tx(tx, graph_doc, doc_id):
-                            # Collection to store created node IDs
+                        def create_kg_tx(tx, graph_doc, doc_id, chunk_idx):
                             nodes_created = {}
                             created_kg_nodes = False
-                            
-                            # Check if the graph document has nodes
+                            # Create entity nodes
                             if hasattr(graph_doc, 'nodes') and graph_doc.nodes:
-                                # Prepare all nodes in one batch
+                                def normalize_value(val):
+                                    if isinstance(val, str):
+                                        return val.strip().lower()
+                                    return val
                                 for node in graph_doc.nodes:
-                                    # Create node with properties
+                                    # Normalize entity properties
+                                    node_id = getattr(node, 'id', None)
+                                    node_name = node.properties.get('name') if hasattr(node, 'properties') and node.properties else None
+                                    node_title = node.properties.get('title') if hasattr(node, 'properties') and node.properties else None
+                                    main_value = normalize_value(node_id or node_name or node_title or "Unknown")
                                     node_properties = {}
-                                    if hasattr(node, 'properties'):
+                                    # Set all three properties to the main value if not present, normalized
+                                    node_properties['id'] = normalize_value(node_id) or main_value
+                                    node_properties['name'] = normalize_value(node_name) or main_value
+                                    node_properties['title'] = normalize_value(node_title) or main_value
+                                    # Add any other properties, normalized
+                                    if hasattr(node, 'properties') and node.properties:
                                         for key, value in node.properties.items():
-                                            if isinstance(value, (str, int, float, bool)):
-                                                node_properties[key] = value
-                                    
-                                    # Get node type & ID
+                                            if key not in ('id', 'name', 'title') and isinstance(value, (str, int, float, bool)):
+                                                node_properties[key] = normalize_value(value)
                                     node_type = node.type if hasattr(node, 'type') else "Entity"
-                                    node_id = node.id if hasattr(node, 'id') else f"unknown_{uuid.uuid4()}"
-                                    
-                                    # Create entity node with simpler labels to avoid Neo4j 4.x limitations
                                     query = f"""
-                                    MERGE (e:__Entity__ {{id: $node_id}})
+                                    MERGE (e:__Entity__ {{id: $node_id, db_name: $db_name}})
                                     SET e.node_type = $node_type,
                                         e += $props
                                     WITH e
-                                    MATCH (d:Document {{document_id: $doc_id}})
+                                    MATCH (d:Document {{document_id: $doc_id, db_name: $db_name}})
                                     MERGE (d)-[:CONTAINS]->(e)
                                     """
-                                    
-                                    tx.run(query, node_id=node_id, node_type=node_type,
-                                         props=node_properties, doc_id=doc_id)
-                                    
-                                    # Track that we created this node
-                                    nodes_created[node_id] = node_type
+                                    tx.run(query, node_id=node_properties['id'], node_type=node_type,
+                                         props=node_properties, doc_id=doc_id, db_name=self.database)
+                                    nodes_created[node_properties['id']] = node_type
                                     created_kg_nodes = True
-                                
+                                    # PATCH: Also link Chunk to Entity for this chunk
+                                    chunk_id = f"{doc_id}_{chunk_idx}"
+                                    tx.run(
+                                        '''
+                                        MATCH (c:Chunk {chunk_id: $chunk_id, db_name: $db_name})
+                                        MATCH (e:__Entity__ {id: $node_id, db_name: $db_name})
+                                        MERGE (c)-[:CONTAINS]->(e)
+                                        ''',
+                                        chunk_id=chunk_id,
+                                        node_id=node_properties['id'],
+                                        db_name=self.database
+                                    )
                             # Create relationships in batch if nodes were created
                             if created_kg_nodes and hasattr(graph_doc, 'relationships') and graph_doc.relationships:
                                 for rel in graph_doc.relationships:
-                                    # Check if we have both source and target with valid IDs
                                     if (hasattr(rel, 'source') and hasattr(rel.source, 'id') and 
                                         hasattr(rel, 'target') and hasattr(rel.target, 'id')):
-                                        
                                         source_id = rel.source.id
                                         target_id = rel.target.id
                                         rel_type = rel.type if hasattr(rel, 'type') else "RELATED_TO"
-                                        
-                                        # Only create relationships between nodes we've processed
                                         if source_id in nodes_created and target_id in nodes_created:
-                                            # Get relationship properties
                                             rel_properties = {}
                                             if hasattr(rel, 'properties'):
                                                 for key, value in rel.properties.items():
                                                     if isinstance(value, (str, int, float, bool)):
                                                         rel_properties[key] = value
-                                            
-                                            # Create relationship with a simpler syntax to avoid Neo4j 4.x limitations
                                             query = f"""
                                             MATCH (source:`__Entity__` {{id: $source_id}})
                                             MATCH (target:`__Entity__` {{id: $target_id}})
@@ -1390,35 +1403,29 @@ class Neo4jDatabaseManager:
                                             SET r.type = $rel_type,
                                                 r += $props
                                             """
-                                            
                                             tx.run(query, source_id=source_id, target_id=target_id, 
                                                  rel_type=rel_type, props=rel_properties)
-                            
                             return created_kg_nodes
-                        
                         # Process each graph document with its own transaction
-                        for graph_doc in graph_documents:
-                            # Skip empty graph documents
+                        for chunk_idx, graph_doc in enumerate(graph_documents):
                             if not (hasattr(graph_doc, 'nodes') and graph_doc.nodes):
                                 continue
-                                
-                            # Process with transaction
-                            created = session.write_transaction(create_kg_tx, graph_doc, document_id)
+                            created = session.write_transaction(create_kg_tx, graph_doc, document_id, chunk_idx)
                             if created:
-                                log_message(f"Added knowledge graph elements for document {document_id}")
+                                log_message(f"Added knowledge graph elements for document {document_id}, chunk {chunk_idx}")
                 
                     return True
                 except Exception as e:
                     log_message(f"Error in knowledge graph processing: {str(e)}", True)
                     log_message(traceback.format_exc(), True)
                     # Create basic document node anyway
-                    with self.driver.session() as session:
+                    with self.driver.session(database=self.database) as session:
                         session.run("""
-                        MERGE (d:Document {document_id: $doc_id})
+                        MERGE (d:Document {document_id: $doc_id, db_name: $db_name})
                         SET d.title = $title,
                             d.content = $content,
                             d.updated_at = datetime()
-                        """, doc_id=document_id, title=title, content=content)
+                        """, doc_id=document_id, title=title, content=content, db_name=self.database)
                     return False
             
             return False
@@ -1426,6 +1433,16 @@ class Neo4jDatabaseManager:
             log_message(f"Error in knowledge graph processing: {str(e)}", True)
             log_message(traceback.format_exc(), True)
             return False
+
+    def cleanup_old_documents_without_db_name(self):
+        try:
+            with self.driver.session(database="neo4j") as session:
+                session.run("MATCH (d:Document) WHERE NOT EXISTS(d.db_name) DETACH DELETE d")
+            log_message("Cleaned up old Document nodes without db_name property.")
+        except Exception as e:
+            log_message(f"Error cleaning up old Document nodes: {str(e)}", True)
+
+
 
 # Override IsDisplayAvailable to always return True
 wx.PyApp.IsDisplayAvailable = lambda _: True
@@ -3103,7 +3120,8 @@ class SettingsDialog(wx.Dialog):
         
         self.EndModal(wx.ID_OK)
 
-# Main application class
+
+
 class ResearchAssistantApp(wx.Frame):
     def __init__(self):
         super(ResearchAssistantApp, self).__init__(
@@ -3124,6 +3142,8 @@ class ResearchAssistantApp(wx.Frame):
         # Multiple database pair management
         self.database_pairs = {}  # pair_name -> {neo4j_manager, neo4j_server, documents, document_priorities}
         self.current_pair_name = "default"
+        # Initialize db_name for the current pair
+        self.db_name = f"pair_{self.current_pair_name}"
         self.database_pairs_config_file = os.path.join(APP_PATH, "database_pairs_config.json")
         
         # Initialize streaming state
@@ -3254,6 +3274,8 @@ class ResearchAssistantApp(wx.Frame):
             
             # Switch to new pair
             self.current_pair_name = pair_name
+            # Update db_name for the new pair
+            self.db_name = f"pair_{self.current_pair_name}"
             
             # Load new pair data
             current_pair = self.get_current_pair_data()
@@ -3571,7 +3593,8 @@ class ResearchAssistantApp(wx.Frame):
                             uri=f"bolt://localhost:{self.neo4j_server.NEO4J_PORT}",
                             username="neo4j",
                             password="neo4j",  # Use default password first, then change it
-                            database=database_name
+                            database=database_name,
+                            db_name=self.db_name
                         )
                         
                         # Test connection
@@ -3663,7 +3686,8 @@ class ResearchAssistantApp(wx.Frame):
                 uri=f"bolt://localhost:{self.neo4j_server.NEO4J_PORT}",
                 username="neo4j",
                 password="neo4j_password",
-                database="neo4j"
+                database="neo4j",
+                db_name=self.db_name
             )
             
             # Initialize vector store
@@ -5320,34 +5344,49 @@ class ResearchAssistantApp(wx.Frame):
             llm_client = self.get_llm_client()
             if not llm_client:
                 return "Error: Could not initialize language model. Please check your configuration."
-            
+
             # Define a callback function for streaming updates
             def update_response_callback(chunk):
                 # Post event to main thread for UI update
                 evt = StreamEvent(text=chunk)
                 wx.PostEvent(self, evt)
-                
-            # Check if RAG is enabled
+
+            # --- PATCH: Always combine vector and graph search results ---
             if hasattr(self, 'rag_toggle') and self.rag_toggle.GetValue():
-                if self.rag_chain:
-                    log_message("Using RAG for response")
-                    response = self.rag_chain(user_message)
+                if self.neo4j_manager:
+                    # 1. Vector search (full query)
+                    vector_results = self.neo4j_manager.query_similar_text(user_message, limit=5, use_graph=False)
+                    # 2. Graph search (top N, not filtered by question)
+                    graph_results = self.neo4j_manager.query_similar_text("", limit=5, use_graph=True)
+                    # 3. Merge and deduplicate
+                    seen = set()
+                    combined_results = []
+                    for doc in vector_results + graph_results:
+                        doc_id = doc.metadata.get("document_id") or doc.metadata.get("chunk_id")
+                        if doc_id and doc_id not in seen:
+                            combined_results.append(doc)
+                            seen.add(doc_id)
+                    # 4. Build context for LLM
+                    context = "\n\n".join([f"[{doc.metadata.get('title', '')}]\n{doc.page_content}" for doc in combined_results])
+                    prompt = f"Use the following context to answer the user's question:\n\n{context}\n\nUser: {user_message}\n\nAssistant:"
+                    # 5. Get LLM answer (streaming if possible)
+                    self.current_streaming_response = ""
+                    response_chunks = []
+                    for chunk in llm_client.generate_streaming(prompt, callback=update_response_callback):
+                        response_chunks.append(chunk)
+                    response = "".join(response_chunks)
+                    return response
                 else:
                     log_message("No RAG chain available, falling back to direct query", True)
-                    # Fall back to direct query
-                    # Initialize streaming response
+                    # Fallback to direct query
                     self.current_streaming_response = ""
-                    
-                    # Use streaming response with callback
                     system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
                     full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
-                    
-                    # Process streaming response
                     response_chunks = []
                     for chunk in llm_client.generate_streaming(full_prompt, callback=update_response_callback):
                         response_chunks.append(chunk)
-                        
                     response = "".join(response_chunks)
+                    return response
             else:
                 # Regular prompt-based approach when RAG is not enabled
                 log_message("Processing message with standard context")
@@ -5503,6 +5542,7 @@ class ResearchAssistantApp(wx.Frame):
         except Exception as e:
             log_message(f"Error managing database pairs: {str(e)}", True)
             wx.MessageBox(f"Error managing database pairs: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
 
 # Dialog for editing conversation history
 class ConversationHistoryDialog(wx.Dialog):
