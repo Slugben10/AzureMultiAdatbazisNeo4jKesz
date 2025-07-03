@@ -6282,6 +6282,9 @@ class LLMClient:
                 callback(f"\n\nError: {error_msg}")
             yield f"\n\nError: {error_msg}"
 
+
+
+
 class DatabasePairManagementDialog(wx.Dialog):
     def __init__(self, parent, database_pairs, current_pair_name):
         super(DatabasePairManagementDialog, self).__init__(
@@ -6289,6 +6292,7 @@ class DatabasePairManagementDialog(wx.Dialog):
             size=(500, 400)
         )
         
+        self.parent = parent  # Save reference to parent for DB access
         self.database_pairs = database_pairs
         self.current_pair_name = current_pair_name
         self.selected_pair = current_pair_name
@@ -6378,14 +6382,20 @@ class DatabasePairManagementDialog(wx.Dialog):
         if self.selected_pair in self.database_pairs:
             pair_data = self.database_pairs[self.selected_pair]
             created_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pair_data.get("created", 0)))
-            doc_count = len(pair_data.get("documents", {}))
-            
+            # Live document count from Neo4j
+            live_doc_count = 0
+            try:
+                if hasattr(self.parent, 'neo4j_manager') and self.parent.neo4j_manager:
+                    db_name = f"pair_{self.selected_pair}"
+                    docs = self.parent.neo4j_manager.get_document_list(db_name)
+                    live_doc_count = len(docs)
+            except Exception as e:
+                live_doc_count = 0
             details = f"Name: {self.selected_pair}\n"
             details += f"Description: {pair_data.get('description', 'No description')}\n"
             details += f"Created: {created_time}\n"
-            details += f"Documents: {doc_count}\n"
+            details += f"Documents: {live_doc_count}\n"
             details += f"Status: {'Current' if self.selected_pair == self.current_pair_name else 'Available'}"
-            
             self.details_text.SetValue(details)
     
     def on_create_pair(self, event):
@@ -6459,6 +6469,7 @@ class DatabasePairManagementDialog(wx.Dialog):
     
     def get_result(self):
         return self.result
+
 
 # Main entry point
 if __name__ == "__main__":
