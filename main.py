@@ -3142,7 +3142,6 @@ class ResearchAssistantApp(wx.Frame):
         # Multiple database pair management
         self.database_pairs = {}  # pair_name -> {neo4j_manager, neo4j_server, documents, document_priorities}
         self.current_pair_name = "default"
-        # Initialize db_name for the current pair
         self.db_name = f"pair_{self.current_pair_name}"
         self.database_pairs_config_file = os.path.join(APP_PATH, "database_pairs_config.json")
         
@@ -3171,9 +3170,8 @@ class ResearchAssistantApp(wx.Frame):
         
         # Load database pairs configuration
         self.load_database_pairs_config()
-        
-        # Load document list from disk
-        self.load_document_info()
+        # Ensure db_name is updated after loading config
+        self.db_name = f"pair_{self.current_pair_name}"
         
         # Setup UI
         self.setup_ui()
