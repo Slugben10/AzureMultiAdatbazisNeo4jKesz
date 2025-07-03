@@ -828,26 +828,24 @@ class Neo4jDatabaseManager:
             log_message(f"Error adding document to database: {str(e)}", True)
             return False
     
-    def remove_document(self, document_id):
-        """Remove a document from both the Neo4j database and vector store"""
+    def remove_document(self, document_id, db_name=None):
+        """Remove a document from both the Neo4j database and vector store for the given db_name"""
         try:
             if not self.connected:
                 log_message("Neo4j connection not available", True)
                 return False
-                
+            db_name = db_name or self.db_name or self.database
             # Check if document exists
             with self.driver.session(database=self.database) as session:
                 result = session.run(
                     "MATCH (d:Document {document_id: $id, db_name: $db_name}) RETURN count(d) AS count",
                     id=document_id,
-                    db_name=self.database
+                    db_name=db_name
                 )
                 doc_exists = result.single()["count"] > 0
-                
             if not doc_exists:
-                log_message(f"Document {document_id} not found in database")
+                log_message(f"Document {document_id} not found in database for db_name {db_name}")
                 return False
-            
             # STEP 1: Remove from Neo4j database
             with self.driver.session(database=self.database) as session:
                 # Delete document node and relationships
@@ -857,43 +855,34 @@ class Neo4jDatabaseManager:
                     DETACH DELETE d
                     """,
                     id=document_id,
-                    db_name=self.database
+                    db_name=db_name
                 )
-                
-            # STEP 2: If using vector store, remove from there too
-            # Unfortunately, most vector stores don't support direct deletion by ID
-            # So we'll need a workaround - we'll note that it's been removed
-            # from the graph database which is the source of truth
-            
-            log_message(f"Document {document_id} removed from database")
+            log_message(f"Document {document_id} removed from database for db_name {db_name}")
             return True
         except Exception as e:
             log_message(f"Error removing document from database: {str(e)}", True)
             return False
     
-    def delete_all_documents(self):
-        """Delete all documents from both Neo4j and vector databases while preserving the databases themselves"""
+    def delete_all_documents(self, db_name=None):
+        """Delete all documents from both Neo4j and vector databases for the given db_name while preserving the databases themselves"""
         try:
             if not self.connected:
                 log_message("Neo4j connection not available", True)
                 return False
-
+            db_name = db_name or self.db_name or self.database
             # STEP 1: Delete all documents from Neo4j database
             with self.driver.session(database=self.database) as session:
-                # Delete all document nodes and their relationships
+                # Delete all document nodes and their relationships for the current db_name
                 # Exclude the placeholder document
                 session.run("""
                     MATCH (d:Document {db_name: $db_name})
                     WHERE d.document_id <> 'placeholder'
                     DETACH DELETE d
-                """, db_name=self.database)
-                log_message("Deleted all documents from Neo4j database")
-
-            # STEP 2: Reinitialize vector store to clear it
+                """, db_name=db_name)
+                log_message(f"Deleted all documents from Neo4j database for db_name {db_name}")
+            # STEP 2: Reinitialize vector store to clear it (if needed)
             if LANGCHAIN_AVAILABLE and self.vector_store:
                 try:
-                    # Instead of directly using Neo4jVectorStore4x which is out of scope,
-                    # call initialize_vector_store to properly reinitialize it
                     current_embedding_function = self.vector_store.embedding_function
                     success = self.initialize_vector_store(current_embedding_function)
                     if success:
@@ -902,17 +891,16 @@ class Neo4jDatabaseManager:
                         log_message("Failed to reinitialize vector store", True)
                 except Exception as e:
                     log_message(f"Error reinitializing vector store: {str(e)}", True)
-                    # Continue even if vector store reinitialization fails
-
-            log_message("All documents deleted successfully")
+            log_message("All documents deleted successfully for db_name {db_name}")
             return True
         except Exception as e:
             log_message(f"Error deleting all documents: {str(e)}", True)
             return False
     
-    def get_document_list(self):
-        """Get list of documents in the database"""
+    def get_document_list(self, db_name=None):
+        """Get list of documents in the database for the given db_name (database pair)"""
         try:
+            db_name = db_name or self.db_name or self.database
             with self.driver.session(database=self.database) as session:
                 result = session.run("""
                     MATCH (d:Document {db_name: $db_name})
@@ -920,7 +908,7 @@ class Neo4jDatabaseManager:
                     RETURN d.document_id as id, d.title as title, COUNT((d)-[:CONTAINS]->()) as chunks, 
                            d.priority as priority
                     ORDER BY d.title
-                """, db_name=self.database)
+                """, db_name=db_name)
                 return [(record["id"], record["title"], record["chunks"], 
                          record["priority"] if record["priority"] is not None else "Medium") 
                         for record in result]
@@ -3121,7 +3109,6 @@ class SettingsDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
 
-
 class ResearchAssistantApp(wx.Frame):
     def __init__(self):
         super(ResearchAssistantApp, self).__init__(
@@ -4636,7 +4623,8 @@ class ResearchAssistantApp(wx.Frame):
                 import hashlib
                 doc_id = hashlib.md5(filename.encode()).hexdigest()
                 
-                if self.neo4j_manager.remove_document(doc_id):
+                # Only delete from the current logical db_name
+                if self.neo4j_manager.remove_document(doc_id, self.db_name):
                     successful += 1
                     log_message(f"Removed document '{filename}' from database")
                 else:
@@ -4679,15 +4667,15 @@ class ResearchAssistantApp(wx.Frame):
 
             # Show confirmation dialog
             confirm = wx.MessageBox(
-                "Are you sure you want to delete ALL documents from both Neo4j and vector databases?\n\n"
+                f"Are you sure you want to delete ALL documents from the current database pair '{self.current_pair_name}'?\n\n"
                 "This action cannot be undone, but you can upload the documents again later.",
                 "Confirm Delete All",
                 wx.YES_NO | wx.ICON_WARNING
             )
 
             if confirm == wx.YES:
-                # Delete all documents
-                success = self.neo4j_manager.delete_all_documents()
+                # Delete all documents only from the current logical db_name
+                success = self.neo4j_manager.delete_all_documents(self.db_name)
                 
                 if success:
                     wx.MessageBox(
@@ -5476,22 +5464,18 @@ class ResearchAssistantApp(wx.Frame):
             vector_docs = []
             try:
                 if hasattr(self.neo4j_manager, 'vector_store') and self.neo4j_manager.vector_store:
-                    # This would require implementing a method to list documents in the vector store
                     vector_docs = ["Vector store documents available"]
             except Exception as e:
                 vector_docs = [f"Error accessing vector store: {str(e)}"]
             
-            # Get documents from Neo4j
+            # Get documents from Neo4j for the current db_name
             neo4j_docs = []
             try:
-                neo4j_doc_tuples = self.neo4j_manager.get_document_list()
-                # Only show documents that are in self.documents (current pair's uploaded docs)
-                uploaded_titles = set(self.documents.keys())
+                neo4j_doc_tuples = self.neo4j_manager.get_document_list(self.db_name)
                 for doc_tuple in neo4j_doc_tuples:
                     if isinstance(doc_tuple, tuple) and len(doc_tuple) >= 2:
                         doc_id, title = doc_tuple[0], doc_tuple[1]
-                        if title in uploaded_titles:
-                            neo4j_docs.append(f"ID: {doc_id} - Title: {title}")
+                        neo4j_docs.append(f"ID: {doc_id} - Title: {title}")
                     else:
                         neo4j_docs.append(str(doc_tuple))
             except Exception as e:
