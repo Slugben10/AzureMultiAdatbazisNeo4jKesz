@@ -5202,17 +5202,15 @@ class ResearchAssistantApp(wx.Frame):
             log_message(traceback.format_exc(), True)
     
     def append_to_chat(self, message, sender):
-        """Append a message to the chat display"""
+        """Append a message to the chat display with clear visual separation and distinction"""
         try:
             # Handle AIMessage objects from LangChain
             if hasattr(message, 'content') and callable(getattr(message, 'content', None)):
-                # This is for older versions of langchain
                 message = message.content()
             elif hasattr(message, 'content') and not callable(getattr(message, 'content', None)):
-                # This is for newer versions of langchain
                 message = message.content
-            
-            # Get current text position for indexing/editing
+
+            # Add extra spacing between messages
             current_position = len(self.chat_display.GetValue())
             if current_position > 0 and not self.chat_display.GetValue().endswith("\n\n"):
                 self.chat_display.AppendText("\n\n")
@@ -5220,70 +5218,85 @@ class ResearchAssistantApp(wx.Frame):
             elif current_position > 0:
                 self.chat_display.AppendText("\n")
                 current_position += 1
-                
-            # Add sender with bold formatting
-            self.chat_display.AppendText(f"{sender}: ")
-            
-            # Set the style for the sender (bold)
+
+            # Add sender label on its own line, bold and colored
+            sender_label = f"{sender}:\n"
+            self.chat_display.AppendText(sender_label)
             end_pos = len(self.chat_display.GetValue())
-            self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.NullColour, wx.NullColour, wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
-            
-            # Add the message text
+            if sender == "You":
+                # User: blue background, bold
+                self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(220, 235, 255), wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
+            else:
+                # Assistant: light yellow background, bold
+                self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(255, 255, 220), wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
+            current_position = end_pos
+
+            # Add the message text, with normal weight but colored background
             self.chat_display.AppendText(str(message))
-            
+            end_pos = len(self.chat_display.GetValue())
+            if sender == "You":
+                self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(220, 235, 255)))
+            else:
+                self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(255, 255, 220)))
+
             # Store the position of this message for editing purposes
             self.message_positions.append(current_position)
-            
-            # Scroll to the bottom
             self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
         except Exception as e:
             log_message(f"Error appending to chat: {str(e)}", True)
-    
+
     def append_streaming_chunk(self, chunk):
-        """Append a streaming chunk to the chat display"""
+        """Append a streaming chunk to the chat display, buffering until a full sentence or paragraph is ready, with clear visual separation for assistant messages"""
         try:
-            # Handle AIMessage objects from LangChain
             if hasattr(chunk, 'content') and callable(getattr(chunk, 'content', None)):
-                # This is for older versions of langchain
                 chunk = chunk.content()
             elif hasattr(chunk, 'content') and not callable(getattr(chunk, 'content', None)):
-                # This is for newer versions of langchain
                 chunk = chunk.content
-            
-            # Ensure chunk is a string
             chunk = str(chunk)
-            
-            # If this is the first chunk, add a new message
-            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None or self.current_streaming_response == "":
-                # Init streaming container if needed
-                if not hasattr(self, 'current_streaming_response'):
-                    self.current_streaming_response = ""
-                
-                # Add a new message from the assistant
-                current_position = len(self.chat_display.GetValue())
-                if current_position > 0 and not self.chat_display.GetValue().endswith("\n\n"):
-                    self.chat_display.AppendText("\n\n")
-                elif current_position > 0:
-                    self.chat_display.AppendText("\n")
-                
-                # Add sender with bold formatting
-                self.chat_display.AppendText("Assistant: ")
-                
-                # Store the position of this message
-                self.message_positions.append(current_position)
-            
-            # Append the new chunk
-            self.chat_display.AppendText(chunk)
-            
-            # Scroll to the bottom
-            self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
-            
-            # Force UI update
-            wx.GetApp().Yield()
+
+            if not hasattr(self, '_stream_buffer') or self._stream_buffer is None:
+                self._stream_buffer = ''
+            self._stream_buffer += chunk
+
+            import re
+            sentence_end_re = re.compile(r'([.!?\n]+)')
+            flush_pos = 0
+            for match in sentence_end_re.finditer(self._stream_buffer):
+                flush_pos = match.end()
+            if flush_pos > 0:
+                to_flush = self._stream_buffer[:flush_pos]
+                self._stream_buffer = self._stream_buffer[flush_pos:]
+            else:
+                to_flush = ''
+
+            if to_flush:
+                # If this is the first chunk, add a new message with clear separation
+                if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None or self.current_streaming_response == "":
+                    if not hasattr(self, 'current_streaming_response'):
+                        self.current_streaming_response = ""
+                    current_position = len(self.chat_display.GetValue())
+                    if current_position > 0 and not self.chat_display.GetValue().endswith("\n\n"):
+                        self.chat_display.AppendText("\n\n")
+                    elif current_position > 0:
+                        self.chat_display.AppendText("\n")
+                    # Add Assistant label, bold and colored
+                    sender_label = "Assistant:\n"
+                    self.chat_display.AppendText(sender_label)
+                    end_pos = len(self.chat_display.GetValue())
+                    self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(255, 255, 220), wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
+                    current_position = end_pos
+                    self.message_positions.append(current_position)
+                # Append the new chunk, with assistant background color
+                start_pos = len(self.chat_display.GetValue())
+                self.chat_display.AppendText(to_flush)
+                end_pos = len(self.chat_display.GetValue())
+                self.chat_display.SetStyle(start_pos, end_pos, wx.TextAttr(wx.BLACK, wx.Colour(255, 255, 220)))
+                self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
+                wx.GetApp().Yield()
         except Exception as e:
             log_message(f"Error appending streaming chunk: {str(e)}", True)
             log_message(traceback.format_exc(), True)
-    
+
     def get_llm_client(self):
         """Get the LLM client based on the selected model"""
         try:
