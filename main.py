@@ -1430,6 +1430,37 @@ class Neo4jDatabaseManager:
         except Exception as e:
             log_message(f"Error cleaning up old Document nodes: {str(e)}", True)
 
+    def delete_everything(self):
+        """Delete ALL nodes, relationships, constraints, and indexes from the Neo4j database (irreversible)"""
+        try:
+            if not self.connected:
+                log_message("Neo4j connection not available", True)
+                return False
+            with self.driver.session(database=self.database) as session:
+                # Drop all constraints
+                constraints = session.run("CALL db.constraints() YIELD name RETURN name").values()
+                for (name,) in constraints:
+                    try:
+                        session.run(f"DROP CONSTRAINT {name}")
+                        log_message(f"Dropped constraint: {name}")
+                    except Exception as e:
+                        log_message(f"Error dropping constraint {name}: {str(e)}", True)
+                # Drop all indexes
+                indexes = session.run("CALL db.indexes() YIELD name RETURN name").values()
+                for (name,) in indexes:
+                    try:
+                        session.run(f"DROP INDEX {name}")
+                        log_message(f"Dropped index: {name}")
+                    except Exception as e:
+                        log_message(f"Error dropping index {name}: {str(e)}", True)
+                # Delete all nodes and relationships
+                session.run("MATCH (n) DETACH DELETE n")
+            log_message("ALL nodes, relationships, constraints, and indexes deleted from Neo4j database!")
+            return True
+        except Exception as e:
+            log_message(f"Error deleting EVERYTHING from Neo4j: {str(e)}", True)
+            return False
+
 
 
 # Override IsDisplayAvailable to always return True
@@ -4082,6 +4113,12 @@ class ResearchAssistantApp(wx.Frame):
             delete_all_btn.Bind(wx.EVT_BUTTON, self.on_delete_all_documents)
             db_actions_sizer.Add(delete_all_btn, 1)
             
+            # Delete Everything button
+            delete_everything_btn = wx.Button(db_actions_panel, label="Delete EVERYTHING (Full Wipe)")
+            delete_everything_btn.SetToolTip("Delete ALL nodes and relationships from ALL Neo4j databases (irreversible!)")
+            delete_everything_btn.Bind(wx.EVT_BUTTON, self.on_delete_everything_from_neo4j)
+            db_actions_sizer.Add(delete_everything_btn, 1)
+            
             db_actions_panel.SetSizer(db_actions_sizer)
             rag_sizer.Add(db_actions_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
@@ -5537,6 +5574,48 @@ class ResearchAssistantApp(wx.Frame):
         except Exception as e:
             log_message(f"Error managing database pairs: {str(e)}", True)
             wx.MessageBox(f"Error managing database pairs: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_delete_everything_from_neo4j(self, event):
+        """Delete EVERYTHING from ALL Neo4j databases (irreversible)"""
+        try:
+            if not self.neo4j_manager or not self.neo4j_manager.connected:
+                wx.MessageBox(
+                    "Not connected to Neo4j database. Please ensure the database is running.",
+                    "Connection Error",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+            confirm = wx.MessageBox(
+                "Are you ABSOLUTELY SURE you want to DELETE EVERYTHING from ALL Neo4j databases?\n\n" +
+                "This will remove ALL nodes, relationships, constraints, and indexes, including ALL documents, knowledge graph, and any other data.\n\n" +
+                "This action CANNOT be undone!\n\nContinue?",
+                "Confirm FULL Neo4j Deletion",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING
+            )
+            if confirm != wx.YES:
+                return
+            # Run the full factory reset
+            success = self.neo4j_manager.delete_everything()
+            if success:
+                wx.MessageBox(
+                    "ALL data, constraints, and indexes have been deleted from the Neo4j database!\n\nYou may need to restart the app.",
+                    "Neo4j FULL FACTORY RESET Complete",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+                self.refresh_document_list()
+            else:
+                wx.MessageBox(
+                    "Failed to delete EVERYTHING from Neo4j. Please check the logs for details.",
+                    "Deletion Failed",
+                    wx.OK | wx.ICON_ERROR
+                )
+        except Exception as e:
+            log_message(f"Error deleting EVERYTHING from Neo4j: {str(e)}", True)
+            wx.MessageBox(
+                f"Error deleting EVERYTHING from Neo4j: {str(e)}",
+                "Deletion Error",
+                wx.OK | wx.ICON_ERROR
+            )
 
 
 # Dialog for editing conversation history
