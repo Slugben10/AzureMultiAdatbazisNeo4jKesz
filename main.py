@@ -1,5 +1,5 @@
 import time
-#import hide_console  # This will hide all console windows
+import hide_console  # This will hide all console windows
 import os
 import json
 import wx
@@ -1743,7 +1743,7 @@ class EmbeddedNeo4jServer:
                     wrapper_conf = os.path.join(neo4j_conf_dir, "neo4j-wrapper.conf")
                     with open(wrapper_conf, 'w') as f:
                         f.write("# Neo4j wrapper configuration\n")
-                        f.write("# Automatically configured by Neo4j Research Assistant\n\n")
+                        f.write("# Automatically configured by RAG Assistant Bot\n\n")
                         # Escape backslashes on Windows
                         if system == "windows":
                             java_bin_esc = java_bin.replace("\\", "\\\\")
@@ -3143,7 +3143,7 @@ class SettingsDialog(wx.Dialog):
 class ResearchAssistantApp(wx.Frame):
     def __init__(self):
         super(ResearchAssistantApp, self).__init__(
-            None, title="Neo4j Research Assistant", 
+            None, title="RAG Assistant Bot", 
             size=(1200, 800)
         )
         
@@ -4163,7 +4163,7 @@ class ResearchAssistantApp(wx.Frame):
             right_sizer = wx.BoxSizer(wx.VERTICAL)
             
             # Chat section title
-            chat_title = wx.StaticText(right_panel, label="Research Assistant Chat")
+            chat_title = wx.StaticText(right_panel, label="RAG Assistant Chat")
             chat_title.SetFont(font)  # Reuse font from above
             right_sizer.Add(chat_title, 0, wx.ALL, 10)
             
@@ -5000,7 +5000,7 @@ class ResearchAssistantApp(wx.Frame):
             self.current_streaming_response = ""
             
             # Create a system prompt with conversation context (shortened version)
-            system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
+            system_prompt = self.config.get("system_prompt", "You are a helpful RAG assistant.")
             
             # Process streaming response
             response_chunks = []
@@ -5416,7 +5416,7 @@ class ResearchAssistantApp(wx.Frame):
                     log_message("No RAG chain available, falling back to direct query", True)
                     # Fallback to direct query
                     self.current_streaming_response = ""
-                    system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
+                    system_prompt = self.config.get("system_prompt", "You are a helpful RAG assistant.")
                     full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
                     response_chunks = []
                     for chunk in llm_client.generate_streaming(full_prompt, callback=update_response_callback):
@@ -5451,7 +5451,7 @@ class ResearchAssistantApp(wx.Frame):
                         doc_context += f"[{filename}]\n{content}\n\n"
                 
                 # Build full prompt
-                system_prompt = self.config.get("system_prompt", "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions.")
+                system_prompt = self.config.get("system_prompt", "You are a helpful AI RAG assistant. Your goal is to help users with document analysis, question answering, and knowledge extraction using the provided documents and instructions.")
                 full_prompt = f"{system_prompt}\n\n{doc_context}User: {user_message}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
                 
                 # Initialize streaming response
@@ -5815,7 +5815,7 @@ def create_default_config():
             },
             "default_model": "azure",
             "max_tokens": 8000,
-            "system_prompt": "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions."
+            "system_prompt": "You are a helpful AI RAG assistant. Your goal is to help users with document analysis, question answering, and knowledge extraction using the provided documents and instructions."
         }
         
         # Save the default configuration
@@ -5831,7 +5831,7 @@ def create_default_config():
             "models": {"openai": {"name": "OpenAI GPT-4", "api_key_env": "OPENAI_API_KEY", "model_name": "gpt-4"}},
             "default_model": "openai",
             "max_tokens": 8000,
-            "system_prompt": "You are a helpful AI research assistant."
+            "system_prompt": "You are a helpful AI RAG assistant."
         }
 
 def create_rag_chain(neo4j_manager, llm_client):
@@ -5862,7 +5862,7 @@ def create_rag_chain(neo4j_manager, llm_client):
         
         # Get base system prompt
         system_prompt = config.get("system_prompt", 
-            "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions.")
+            "You are a helpful AI RAG assistant. Your goal is to help users with document analysis, question answering, and knowledge extraction using the provided documents and instructions.")
         
         # Create prompt template with base prompt plus RAG-specific additions
         prompt = ChatPromptTemplate.from_template(f"""
@@ -6563,11 +6563,47 @@ class DatabasePairManagementDialog(wx.Dialog):
         return self.result
 
 
+# Import license client
+try:
+    from license_client import check_license
+    LICENSE_AVAILABLE = True
+    log_message("License client imported successfully")
+except ImportError:
+    LICENSE_AVAILABLE = False
+    log_message("Warning: license_client.py not found. License validation will be skipped.", True)
+
 # Main entry point
 if __name__ == "__main__":
     try:
         # Set up logging
         log_file = setup_error_logging()
+        
+        # License validation - check before starting the app
+        if LICENSE_AVAILABLE:
+            log_message("Starting license validation...")
+            API_URL = "https://demo.freshlook.hu/license-api/verify_license.php"
+            
+            # License validation with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if check_license(API_URL):
+                        log_message("✅ License validation successful!")
+                        break
+                    else:
+                        if attempt < max_retries - 1:
+                            log_message(f"License validation failed (attempt {attempt + 1}/{max_retries}). Retrying...", True)
+                        else:
+                            log_message("❌ License validation failed after all attempts. Exiting application.", True)
+                            sys.exit(1)
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        log_message(f"License validation error (attempt {attempt + 1}/{max_retries}): {str(e)}. Retrying...", True)
+                    else:
+                        log_message(f"❌ License validation error after all attempts: {str(e)}. Exiting application.", True)
+                        sys.exit(1)
+        else:
+            log_message("License validation skipped - license_client.py not found")
         
         # Check for Google packages first - most common issue
         log_message("Checking Google packages installation...")

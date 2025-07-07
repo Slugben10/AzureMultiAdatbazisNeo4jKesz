@@ -6,7 +6,7 @@ import subprocess
 import importlib.util
 
 # Define the app name for consistent reference
-APP_NAME = "RA"
+APP_NAME = "RAG_Assistant"
 
 # Windows-specific function to create a proper Neo4j configuration for Windows paths
 def create_windows_neo4j_conf():
@@ -166,7 +166,7 @@ if not os.path.exists("config.json"):
         },
         "default_model": "openai",
         "max_tokens": 8000,
-        "system_prompt": "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions.",
+        "system_prompt": "You are a helpful AI RAG assistant. Your goal is to help users with document analysis, question answering, and knowledge extraction using the provided documents and instructions.",
         "preserve_neo4j_data": True,  # Add flag to preserve Neo4j data between runs
         "download_neo4j_if_missing": True  # Add flag to download Neo4j if not found
     }
@@ -400,6 +400,7 @@ data_files = [
     ("install_java.py", "."),  # Include Java installer script
     ("force_java_config.py", "."),  # Include Java force config script
     ("download_neo4j.py", "."),  # Include Neo4j downloader script
+    ("license_client.py", "."),  # Include license client script
 ]
 
 # Add Windows-specific Neo4j configuration template if it exists
@@ -465,6 +466,13 @@ hidden_imports = [
     "tiktoken",
     "tiktoken_ext",
     "tiktoken_ext.openai_public",
+    # License client imports
+    "license_client",
+    "uuid",
+    "requests",
+    "json",
+    "datetime",
+    "timedelta",
 ]
 
 # Try to include optional packages
@@ -507,8 +515,8 @@ for src, dst in data_files:
 # Platform specific settings
 if sys.platform == 'darwin':  # macOS
     print("Building for macOS...")
-    #pyinstaller_args.append('--windowed')
-    #pyinstaller_args.append('--noconsole')  # Hide console window on macOS
+    pyinstaller_args.append('--windowed')
+    pyinstaller_args.append('--noconsole')  # Hide console window on macOS
     pyinstaller_args.append('--osx-bundle-identifier=com.researchassistant.app')
     
     # Add icon if available
@@ -565,7 +573,7 @@ try:
         f.write("You can also run install_java.py manually to install Java.\n")
 
     # Copy key files to the output folder
-    key_files = ['config.json', '.env', 'download_neo4j.py', 'install_java.py', 'force_java_config.py']
+    key_files = ['config.json', '.env', 'download_neo4j.py', 'install_java.py', 'force_java_config.py', 'license_client.py']
     for file in key_files:
         if os.path.exists(file):
             shutil.copy(file, dist_dir)
